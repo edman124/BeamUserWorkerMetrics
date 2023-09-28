@@ -566,7 +566,7 @@ public class StreamingDataflowWorker {
             Executors.newSingleThreadScheduledExecutor(
                 new ThreadFactoryBuilder().setNameFormat(threadName).build()));
   }
-
+  
   @VisibleForTesting
   StreamingDataflowWorker(
       List<MapTask> mapTasks,
@@ -640,6 +640,142 @@ public class StreamingDataflowWorker {
             chooseMaximumBundlesOutstanding(),
             chooseMaximumBytesOutstanding(),
             threadFactory);
+
+    maxSinkBytes =
+        hasExperiment(options, "disable_limiting_bundle_sink_bytes")
+            ? Long.MAX_VALUE
+            : MAX_SINK_BYTES;
+
+    memoryMonitorThread = new Thread(memoryMonitor);
+    memoryMonitorThread.setPriority(Thread.MIN_PRIORITY);
+    memoryMonitorThread.setName("MemoryMonitor");
+
+    dispatchThread =
+        new Thread(
+            new Runnable() {
+              @Override
+              public void run() {
+                LOG.info("Dispatch starting");
+                if (windmillServiceEnabled) {
+                  streamingDispatchLoop();
+                } else {
+                  dispatchLoop();
+                }
+                LOG.info("Dispatch done");
+              }
+            });
+    dispatchThread.setDaemon(true);
+    dispatchThread.setPriority(Thread.MIN_PRIORITY);
+    dispatchThread.setName("DispatchThread");
+
+    commitThread =
+        new Thread(
+            new Runnable() {
+              @Override
+              public void run() {
+                if (windmillServiceEnabled) {
+                  streamingCommitLoop();
+                } else {
+                  commitLoop();
+                }
+              }
+            });
+    commitThread.setDaemon(true);
+    commitThread.setPriority(Thread.MAX_PRIORITY);
+    commitThread.setName("CommitThread");
+
+    this.publishCounters = publishCounters;
+    this.windmillServer = options.getWindmillServerStub();
+    this.metricTrackingWindmillServer =
+        new MetricTrackingWindmillServerStub(windmillServer, memoryMonitor, windmillServiceEnabled);
+    this.metricTrackingWindmillServer.start();
+    this.stateFetcher = new StateFetcher(metricTrackingWindmillServer);
+    this.clientId = clientIdGenerator.nextLong();
+
+    for (MapTask mapTask : mapTasks) {
+      addComputation(mapTask.getSystemName(), mapTask, ImmutableMap.of());
+    }
+
+    // Register standard file systems.
+    FileSystems.setDefaultPipelineOptions(options);
+
+    this.mapTaskToNetwork = mapTaskToBaseNetwork;
+
+    LOG.debug("windmillServiceEnabled: {}", windmillServiceEnabled);
+    LOG.debug("WindmillServiceEndpoint: {}", options.getWindmillServiceEndpoint());
+    LOG.debug("WindmillServicePort: {}", options.getWindmillServicePort());
+    LOG.debug("LocalWindmillHostport: {}", options.getLocalWindmillHostport());
+    LOG.debug("maxWorkItemCommitBytes: {}", maxWorkItemCommitBytes);
+  }
+
+
+  @VisibleForTesting
+  StreamingDataflowWorker(
+      List<MapTask> mapTasks,
+      DataflowMapTaskExecutorFactory mapTaskExecutorFactory,
+      WorkUnitClient workUnitClient,
+      StreamingDataflowWorkerOptions options,
+      boolean publishCounters,
+      HotKeyLogger hotKeyLogger,
+      Supplier<Instant> clock,
+      Function<String, ScheduledExecutorService> executorSupplier,
+      BoundedQueueExecutor executor)
+      throws IOException {
+    this.stateCache = new WindmillStateCache(options.getWorkerCacheMb());
+    this.readerCache =
+        new ReaderCache(
+            Duration.standardSeconds(options.getReaderCacheTimeoutSec()),
+            Executors.newCachedThreadPool());
+    this.mapTaskExecutorFactory = mapTaskExecutorFactory;
+    this.workUnitClient = workUnitClient;
+    this.options = options;
+    this.hotKeyLogger = hotKeyLogger;
+    this.clock = clock;
+    this.executorSupplier = executorSupplier;
+    this.windmillServiceEnabled = options.isEnableStreamingEngine();
+    this.memoryMonitor = MemoryMonitor.fromOptions(options);
+    this.statusPages = WorkerStatusPages.create(DEFAULT_STATUS_PORT, memoryMonitor, () -> true);
+    if (windmillServiceEnabled) {
+      this.debugCaptureManager =
+          new DebugCapture.Manager(options, statusPages.getDebugCapturePages());
+    }
+    this.windmillShuffleBytesRead =
+        pendingDeltaCounters.longSum(
+            StreamingSystemCounterNames.WINDMILL_SHUFFLE_BYTES_READ.counterName());
+    this.windmillStateBytesRead =
+        pendingDeltaCounters.longSum(
+            StreamingSystemCounterNames.WINDMILL_STATE_BYTES_READ.counterName());
+    this.windmillStateBytesWritten =
+        pendingDeltaCounters.longSum(
+            StreamingSystemCounterNames.WINDMILL_STATE_BYTES_WRITTEN.counterName());
+    this.windmillQuotaThrottling =
+        pendingDeltaCounters.longSum(
+            StreamingSystemCounterNames.WINDMILL_QUOTA_THROTTLING.counterName());
+    this.javaHarnessUsedMemory =
+        pendingCumulativeCounters.longSum(
+            StreamingSystemCounterNames.JAVA_HARNESS_USED_MEMORY.counterName());
+    this.javaHarnessMaxMemory =
+        pendingCumulativeCounters.longSum(
+            StreamingSystemCounterNames.JAVA_HARNESS_MAX_MEMORY.counterName());
+    this.timeAtMaxActiveThreads =
+        pendingCumulativeCounters.longSum(
+            StreamingSystemCounterNames.TIME_AT_MAX_ACTIVE_THREADS.counterName());
+    this.activeThreads =
+        pendingCumulativeCounters.intSum(StreamingSystemCounterNames.ACTIVE_THREADS.counterName());
+    this.maxActiveThreads =
+        pendingCumulativeCounters.intSum(
+            StreamingSystemCounterNames.MAX_ACTIVE_THREADS.counterName());
+    this.windmillMaxObservedWorkItemCommitBytes =
+        pendingCumulativeCounters.intMax(
+            StreamingSystemCounterNames.WINDMILL_MAX_WORK_ITEM_COMMIT_BYTES.counterName());
+    this.memoryThrashing =
+        pendingCumulativeCounters.intSum(
+            StreamingSystemCounterNames.MEMORY_THRASHING.counterName());
+    this.isDoneFuture = new CompletableFuture<>();
+
+    this.threadFactory =
+        new ThreadFactoryBuilder().setNameFormat("DataflowWorkUnits-%d").setDaemon(true).build();
+    this.workUnitExecutor = executor;
 
     maxSinkBytes =
         hasExperiment(options, "disable_limiting_bundle_sink_bytes")
@@ -1257,6 +1393,8 @@ public class StreamingDataflowWorker {
     final String computationId = computationState.getComputationId();
     final ByteString key = workItem.getKey();
     work.setState(State.PROCESSING);
+    activeThreads.addValue(1);
+    LOG.info("[chengedward] incremented active threads: " + activeThreads.getAggregate());
     {
       StringBuilder workIdBuilder = new StringBuilder(33);
       workIdBuilder.append(Long.toHexString(workItem.getShardingKey()));
@@ -1277,6 +1415,8 @@ public class StreamingDataflowWorker {
       outputBuilder.setSourceStateUpdates(Windmill.SourceState.newBuilder().setOnlyFinalize(true));
       work.setState(State.COMMIT_QUEUED);
       commitQueue.put(new Commit(outputBuilder.build(), computationState, work));
+      activeThreads.addValue(-1);
+      LOG.info("[chengedward] failed commit decrement active threads: " + activeThreads.getAggregate());
       return;
     }
 
@@ -1597,6 +1737,8 @@ public class StreamingDataflowWorker {
         stageInfo.timerProcessingMsecs.addValue(processingTimeMsecs);
       }
 
+      activeThreads.addValue(-1);
+      LOG.info("[chengedward] completed work decrement active threads: " + activeThreads.getAggregate());
       DataflowWorkerLoggingMDC.setWorkId(null);
       DataflowWorkerLoggingMDC.setStageName(null);
     }
@@ -2034,8 +2176,8 @@ public class StreamingDataflowWorker {
   private void updateThreadMetrics() {
     timeAtMaxActiveThreads.getAndReset();
     timeAtMaxActiveThreads.addValue(workUnitExecutor.allThreadsActiveTime());
-    activeThreads.getAndReset();
-    activeThreads.addValue(workUnitExecutor.activeCount());
+    // activeThreads.getAndReset();
+    // activeThreads.addValue(workUnitExecutor.activeCount());
     maxActiveThreads.getAndReset();
     maxActiveThreads.addValue(chooseMaximumNumberOfThreads());
   }

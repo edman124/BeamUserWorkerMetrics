@@ -2947,6 +2947,8 @@ public class StreamingDataflowWorkerTest {
   public void testActiveThreadMetric() throws Exception {
     int maxThreads = 5;
     int threadExpirationSec = 60;
+    FakeWindmillServer server = new FakeWindmillServer(errorCollector);
+    StreamingDataflowWorkerOptions options = createTestingPipelineOptions(server);
     // setting up actual implementation of executor instead of mocking to keep track of
     // active thread count.
     BoundedQueueExecutor executor =
@@ -2960,6 +2962,20 @@ public class StreamingDataflowWorkerTest {
                 .setNameFormat("DataflowWorkUnits-%d")
                 .setDaemon(true)
                 .build());
+    
+    
+    StreamingDataflowWorker worker = new StreamingDataflowWorker(
+            Arrays.asList(defaultMapTask(Arrays.asList(makeSourceInstruction(StringUtf8Coder.of())))),
+            IntrinsicMapTaskExecutorFactory.defaultFactory(),
+            mockWorkUnitClient,
+            options,
+            true,
+            hotKeyLogger,
+            Instant::now,
+            (threadName) -> Executors.newSingleThreadScheduledExecutor(),
+            executor);
+    worker.addStateNameMappings(
+        ImmutableMap.of(DEFAULT_PARDO_USER_NAME, DEFAULT_PARDO_STATE_FAMILY));
 
     StreamingDataflowWorker.ComputationState computationState =
         new StreamingDataflowWorker.ComputationState(
@@ -2976,6 +2992,7 @@ public class StreamingDataflowWorkerTest {
         new MockActiveWork(1) {
           @Override
           public void run() {
+            LOG.info("[chengedward] m1 starting run");
             synchronized (this) {
               this.notify();
             }
@@ -2992,6 +3009,7 @@ public class StreamingDataflowWorkerTest {
         new MockWork(2) {
           @Override
           public void run() {
+            LOG.info("[chengedward] m2 starting run");
             synchronized (this) {
               this.notify();
             }
@@ -3006,6 +3024,7 @@ public class StreamingDataflowWorkerTest {
     // idle work
     MockWork m3 =
         new MockWork(3) {
+          LOG.info("[chengedward] m3 starting run");
           @Override
           public void run() {
             synchronized (this) {
@@ -3018,16 +3037,16 @@ public class StreamingDataflowWorkerTest {
             }
           }
         };
-    assertEquals(0, executor.activeCount());
+    Iterable<CounterUpdate> counters = worker.buildCounters();
+    assertEquals(0, splitIntToLong(getCounter(counters, "dataflow_active_threads").getInteger()));
 
     assertTrue(computationState.activateWork(key1Shard1, m1));
     synchronized (m1) {
       executor.execute(m1, m1.getWorkItem().getSerializedSize());
-      LOG.info("[chengedward] waiting on thread start m1]");
       m1.wait();
     }
-    LOG.info("[chengedward] thread started m1]");
-    assertEquals(2, executor.activeCount());
+    worker.reportPeriodicWorkerUpdates();
+    assertEquals(2, splitIntToLong(getCounter(counters, "dataflow_active_threads").getInteger()));
 
     assertTrue(computationState.activateWork(key1Shard1, m2));
     assertTrue(computationState.activateWork(key1Shard1, m3));
@@ -3039,11 +3058,11 @@ public class StreamingDataflowWorkerTest {
       executor.execute(m3, m3.getWorkItem().getSerializedSize());
       m3.wait();
     }
-    // this.wait();
-    assertEquals(4, executor.activeCount());
+    worker.reportPeriodicWorkerUpdates();
+    assertEquals(4, splitIntToLong(getCounter(counters, "dataflow_active_threads").getInteger()));
 
     m1.stop();
-    executor.shutdown();
+    worker.stop();
   }
 
   static class TestExceptionInvalidatesCacheFn
